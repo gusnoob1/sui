@@ -22,6 +22,8 @@ use sui_types::{crypto::KeyPair, messages::CallArg};
 /// The maximum gas per transaction.
 pub const MAX_GAS: u64 = 10_000;
 
+pub type AddressAndKeyPair = (SuiAddress, KeyPair);
+
 /// Make a few different single-writer test transactions owned by specific addresses.
 pub fn test_transactions<K>(keys: K) -> (Vec<Transaction>, Vec<Object>)
 where
@@ -116,7 +118,7 @@ pub fn test_shared_object_transactions() -> Vec<Transaction> {
 }
 
 /// Make a transaction to publish a test move contracts package.
-pub fn create_publish_move_package_transaction(gas_object: Object, path: PathBuf) -> Transaction {
+pub fn create_publish_move_package_transaction(gas_object_ref: ObjectRef, path: PathBuf, sender: SuiAddress, keypair: &KeyPair) -> Transaction {
     let build_config = BuildConfig::default();
     let modules = sui_framework::build_move_package(&path, build_config).unwrap();
 
@@ -128,24 +130,20 @@ pub fn create_publish_move_package_transaction(gas_object: Object, path: PathBuf
             module_bytes
         })
         .collect();
-
-    let gas_object_ref = gas_object.compute_object_reference();
-    let (sender, keypair) = test_keys().pop().unwrap();
     let data = TransactionData::new_module(sender, gas_object_ref, all_module_bytes, MAX_GAS);
-    let signature = Signature::new(&data, &keypair);
+    let signature = Signature::new(&data, keypair);
     Transaction::new(data, signature)
 }
 
-pub fn make_transfer_sui_transaction(gas_object: Object, recipient: SuiAddress) -> Transaction {
-    let (sender, keypair) = test_keys().pop().unwrap();
+pub fn make_transfer_sui_transaction(gas_object: ObjectRef, recipient: SuiAddress, amount: Option<u64>, sender: SuiAddress, keypair: &KeyPair) -> Transaction {
     let data = TransactionData::new_transfer_sui(
         recipient,
         sender,
-        None,
-        gas_object.compute_object_reference(),
+        amount,
+        gas_object,
         MAX_GAS,
     );
-    let signature = Signature::new(&data, &keypair);
+    let signature = Signature::new(&data, keypair);
     Transaction::new(data, signature)
 }
 
@@ -183,8 +181,9 @@ pub fn make_publish_basics_transaction(gas_object: ObjectRef) -> Transaction {
 pub fn make_counter_create_transaction(
     gas_object: ObjectRef,
     package_ref: ObjectRef,
+    sender: SuiAddress,
+    keypair: &KeyPair,
 ) -> Transaction {
-    let (sender, keypair) = test_keys().pop().unwrap();
     let data = TransactionData::new_move_call(
         sender,
         package_ref,
@@ -195,7 +194,7 @@ pub fn make_counter_create_transaction(
         vec![],
         MAX_GAS,
     );
-    let signature = Signature::new(&data, &keypair);
+    let signature = Signature::new(&data, keypair);
     Transaction::new(data, signature)
 }
 
@@ -203,8 +202,9 @@ pub fn make_counter_increment_transaction(
     gas_object: ObjectRef,
     package_ref: ObjectRef,
     counter_id: ObjectID,
+    sender: SuiAddress,
+    keypair: &KeyPair
 ) -> Transaction {
-    let (sender, keypair) = test_keys().pop().unwrap();
     let data = TransactionData::new_move_call(
         sender,
         package_ref,
@@ -215,7 +215,7 @@ pub fn make_counter_increment_transaction(
         vec![CallArg::Object(ObjectArg::SharedObject(counter_id))],
         MAX_GAS,
     );
-    let signature = Signature::new(&data, &keypair);
+    let signature = Signature::new(&data, keypair);
     Transaction::new(data, signature)
 }
 

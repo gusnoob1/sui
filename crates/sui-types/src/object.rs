@@ -518,7 +518,7 @@ impl Object {
 
     pub fn with_id_owner_for_testing(id: ObjectID, owner: SuiAddress) -> Self {
         // For testing, we provide sufficient gas by default.
-        Self::with_id_owner_gas_for_testing(id, owner, GAS_VALUE_FOR_TESTING)
+        Self::with_id_owner_gas_for_testing(id, owner, u64::MAX)
     }
 
     pub fn with_id_owner_version_for_testing(

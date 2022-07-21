@@ -4,27 +4,43 @@ use clap::*;
 use futures::future::try_join_all;
 use futures::future::BoxFuture;
 use futures::FutureExt;
+use sui_benchmark::stress::context::get_latest;
+use sui_config::Config;
 use futures::{stream::FuturesUnordered, StreamExt};
+use sui_config::PersistedConfig;
+
+use sui_config::SUI_GATEWAY_CONFIG;
+use sui_config::sui_config_dir;
+use sui_core::authority_aggregator::AuthAggMetrics;
+use sui_types::base_types::ObjectID;
+use sui_types::base_types::SuiAddress;
+
+use test_utils::objects::generate_gas_objects_with_owner;
+use test_utils::test_keys;
 use std::collections::{BTreeMap, VecDeque};
+
+
+use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
+use sui_gateway::config::GatewayConfig;
+
 use std::time::Duration;
 use strum_macros::EnumString;
 use sui_benchmark::stress::context::Payload;
 use sui_benchmark::stress::context::StressTestCtx;
 use sui_benchmark::stress::shared_counter::SharedCounterTestCtx;
 use sui_benchmark::stress::transfer_object::TransferObjectTestCtx;
-use sui_config::NetworkConfig;
 use sui_core::authority_aggregator::AuthorityAggregator;
 use sui_core::authority_client::NetworkAuthorityClient;
 use sui_node::SuiNode;
 use sui_quorum_driver::QuorumDriverHandler;
-use sui_types::crypto::EmptySignInfo;
+use sui_types::crypto::{EmptySignInfo, KeyPair};
 use sui_types::messages::{
     ExecuteTransactionRequest, ExecuteTransactionRequestType, ExecuteTransactionResponse,
     Transaction, TransactionEnvelope,
 };
 use test_utils::authority::{
-    spawn_test_authorities, test_and_configure_authority_configs, test_authority_aggregator,
+    spawn_test_authorities, test_and_configure_authority_configs,
 };
 use tokio::runtime::Builder;
 use tokio::time;
@@ -34,7 +50,7 @@ use tracing::{debug, error};
 #[derive(Parser)]
 #[clap(name = "Stress Testing Framework")]
 struct Opts {
-    /// Size of the Sui committee.
+    /// Si&ze of the Sui committee.
     #[clap(long, default_value = "4", global = true)]
     pub committee_size: u64,
     /// Target qps
@@ -44,7 +60,7 @@ struct Opts {
     #[clap(long, default_value = "12", global = true)]
     pub num_workers: u64,
     /// Max in-flight ratio
-    #[clap(long, default_value = "10", global = true)]
+    #[clap(long, default_value = "5", global = true)]
     pub in_flight_ratio: u64,
     /// Num of accounts to use for transfer objects
     #[clap(long, default_value = "5", global = true)]
@@ -62,6 +78,14 @@ struct Opts {
     /// ideally same as number of workers
     #[clap(long, default_value = "3", global = true)]
     pub num_client_threads: usize,
+    #[clap(long, default_value = "/tmp/gateway.yaml", global = true)]
+    pub gateway_config_path: String,
+    #[clap(long, default_value = "/tmp/sui.keystore", global = true)]
+    pub keypair_path: String,
+    #[clap(long, default_value = "", global = true)]
+    pub master_gas_id: String,
+    #[clap(long, parse(try_from_str), default_value = "true", global = true)]
+    pub local: bool,
 }
 
 struct Stats {
@@ -97,6 +121,7 @@ async fn run(
     opts: Opts,
 ) {
     eprintln!("Starting benchmark!");
+    eprintln!("size = {}", payloads.len());
     let payload_per_worker = payloads.len() / opts.num_workers as usize;
     let partitioned_payload: Vec<Vec<Arc<dyn Payload>>> = payloads
         .chunks(payload_per_worker)
@@ -320,23 +345,24 @@ async fn run(
 }
 
 fn make_test_ctx(
+    master_gas_id: ObjectID,
+    master_gas_account_owner: SuiAddress,
+    master_gas_account_keypair: KeyPair,
     max_in_flight_ops: usize,
-    configs: &NetworkConfig,
     opts: &Opts,
 ) -> Box<dyn StressTestCtx<dyn Payload>> {
     match opts.transaction_type {
         TransactionType::SharedCounter => {
-            SharedCounterTestCtx::make_ctx(max_in_flight_ops as u64, configs)
+            SharedCounterTestCtx::make_ctx(max_in_flight_ops as u64, master_gas_id, master_gas_account_owner, master_gas_account_keypair)
         }
         TransactionType::TransferObject => TransferObjectTestCtx::make_ctx(
-            max_in_flight_ops as u64,
-            opts.num_transfer_accounts,
-            configs,
+            max_in_flight_ops as u64, opts.num_transfer_accounts, master_gas_id, master_gas_account_owner, master_gas_account_keypair
         ),
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let mut config = telemetry_subscribers::TelemetryConfig::new("stress");
     config.log_string = Some("warn".to_string());
     config.log_file = Some("/tmp/stress.log".to_string());
@@ -346,45 +372,83 @@ fn main() {
     // This is the maximum number of increment counter ops in flight
     let max_in_flight_ops = opts.target_qps as usize * opts.in_flight_ratio as usize;
 
-    let configs = {
-        let mut configs = test_and_configure_authority_configs(opts.committee_size as usize);
-        configs.validator_configs.iter_mut().for_each(|config| {
-            let parameters = &mut config.consensus_config.as_mut().unwrap().narwhal_config;
-            parameters.batch_size = 12800;
-        });
-        Arc::new(configs)
-    };
-
-    let mut ctx = make_test_ctx(max_in_flight_ops, &configs, &opts);
-
-    let genesis_objects = ctx.get_gas_objects();
-
-    // Make the client runtime wait until we are done creating genesis objects
     let barrier = Arc::new(Barrier::new(2));
     let cloned_barrier = barrier.clone();
-    let cloned_config = configs.clone();
-    // spawn a thread to spin up sui nodes on the multi-threaded server runtime
-    let _ = std::thread::spawn(move || {
-        // create server runtime
-        let server_runtime = Builder::new_multi_thread()
-            .thread_stack_size(32 * 1024 * 1024)
-            .worker_threads(opts.num_server_threads)
-            .enable_all()
-            .build()
-            .unwrap();
-        server_runtime.block_on(async move {
-            // Setup the network
-            let nodes: Vec<SuiNode> =
-                spawn_test_authorities(genesis_objects.clone(), &cloned_config).await;
-            let handles: Vec<_> = nodes.into_iter().map(move |node| node.wait()).collect();
-            cloned_barrier.wait();
-            if try_join_all(handles).await.is_err() {
-                error!("Failed while waiting for nodes");
-            }
+    let (master_gas_id, owner, keypair, gateway_config) = if opts.local {
+        eprintln!("Configuring local benchmark..");
+        let configs = {
+            let mut configs = test_and_configure_authority_configs(opts.committee_size as usize);
+            configs.validator_configs.iter_mut().for_each(|config| {
+                let parameters = &mut config.consensus_config.as_mut().unwrap().narwhal_config;
+                parameters.batch_size = 12800;
+            });
+            Arc::new(configs)
+        };
+        let gc = GatewayConfig {
+            epoch: 0,
+            validator_set: configs.validator_set().to_vec(),
+            send_timeout: Duration::from_secs(4),
+            recv_timeout: Duration::from_secs(4),
+            buffer_size: 650000,
+            db_folder_path: PathBuf::from("/Users/sadhansood/.sui/sui_config/client_db"),
+        };
+        if gc.save(&opts.gateway_config_path).is_err() {
+            error!("Failed to save gatewya config at path: {}", opts.gateway_config_path);
+        }
+        // bring up servers ..
+        let (owner, keypair): (SuiAddress, KeyPair) = test_keys().pop().unwrap();
+        eprintln!("master address = {:?}", owner);
+        let master_gas = generate_gas_objects_with_owner(1, owner);
+        let master_gas_id = master_gas.get(0).unwrap().id();
+        // Make the client runtime wait until we are done creating genesis objects
+        let cloned_config = configs;
+        let cloned_gas = master_gas;
+        // spawn a thread to spin up sui nodes on the multi-threaded server runtime
+        let _ = std::thread::spawn(move || {
+            // create server runtime
+            let server_runtime = Builder::new_multi_thread()
+                .thread_stack_size(32 * 1024 * 1024)
+                .worker_threads(opts.num_server_threads)
+                .enable_all()
+                .build()
+                .unwrap();
+            server_runtime.block_on(async move {
+                // Setup the network
+                let nodes: Vec<SuiNode> =
+                    spawn_test_authorities(cloned_gas, &cloned_config).await;
+                let handles: Vec<_> = nodes.into_iter().map(move |node| node.wait()).collect();
+                cloned_barrier.wait();
+                if try_join_all(handles).await.is_err() {
+                    error!("Failed while waiting for nodes");
+                }
+            });
         });
-    });
-
+        (master_gas_id, owner, keypair, gc)
+    } else {
+        eprintln!("Configuring remote benchmark..");
+        cloned_barrier.wait();
+        let config_path = Some(&opts.gateway_config_path)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| sui_config_dir().unwrap().join(SUI_GATEWAY_CONFIG));
+        let config: GatewayConfig = PersistedConfig::read(&config_path).unwrap();
+        let committee = config.make_committee().unwrap();
+        let authority_clients = config.make_authority_clients();
+        let metrics = AuthAggMetrics::new(&prometheus::Registry::new());
+        let aggregator = AuthorityAggregator::new(committee, authority_clients, metrics);
+        let master_gas_id = ObjectID::from_hex_literal(&opts.master_gas_id).unwrap();
+        let master_gas = get_latest(master_gas_id, &aggregator).await;
+        let keypair_path =  Some(&opts.keypair_path)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap();
+        let contents = std::fs::read_to_string(keypair_path).unwrap();
+        let keypair: KeyPair = contents.parse().unwrap();
+        (master_gas_id, master_gas.owner.get_owner_address().unwrap(), keypair, config)
+    };
     barrier.wait();
+    eprint!("setting up client..");
+    let ctx = make_test_ctx(master_gas_id, owner, keypair, max_in_flight_ops, &opts);
     // create client runtime
     let client_runtime = Builder::new_multi_thread()
         .enable_all()
@@ -392,14 +456,23 @@ fn main() {
         .worker_threads(opts.num_client_threads)
         .build()
         .unwrap();
-    client_runtime.block_on(async move {
-        let mut payloads = ctx.make_test_payloads(&configs).await;
-        let clients = test_authority_aggregator(&configs);
-        let mut p: Vec<Arc<dyn Payload>> = vec![];
-        while !payloads.is_empty() {
-            let entry: Box<dyn Payload> = payloads.pop().unwrap();
-            p.push(Arc::from(entry));
-        }
-        run(clients, p, opts).await
+    let handle = std::thread::spawn(move || {   
+        client_runtime.block_on(async move {
+            let committee = gateway_config.make_committee().unwrap();
+            let authority_clients = gateway_config.make_authority_clients();
+            let metrics = AuthAggMetrics::new(&prometheus::Registry::new());
+            let aggregator = AuthorityAggregator::new(committee, authority_clients, metrics);
+            let mut payloads = ctx.make_test_payloads(&aggregator).await;
+            let mut p: Vec<Arc<dyn Payload>> = vec![];
+            while !payloads.is_empty() {
+                let entry: Box<dyn Payload> = payloads.pop().unwrap();
+                p.push(Arc::from(entry));
+            }
+            run(aggregator, p, opts).await
+        });
     });
+    if handle.join().is_err() {
+        error!("Error while waiting for thread to join");
+    }
+    
 }

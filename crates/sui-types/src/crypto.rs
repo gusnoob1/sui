@@ -6,6 +6,7 @@ use std::str::FromStr;
 
 use anyhow::Error;
 use base64ct::Encoding;
+
 use digest::Digest;
 use narwhal_crypto::ed25519::{
     Ed25519AggregateSignature, Ed25519KeyPair, Ed25519PrivateKey, Ed25519PublicKey,
@@ -95,6 +96,8 @@ impl Display for PublicKeyBytes {
 
 impl ToFromBytes for PublicKeyBytes {
     fn from_bytes(bytes: &[u8]) -> Result<Self, signature::Error> {
+        //let decoded = &decode(bytes).unwrap();
+        //let arr: &[u8] = &decoded;
         let bytes: [u8; PublicKey::LENGTH] =
             bytes.try_into().map_err(signature::Error::from_source)?;
         Ok(PublicKeyBytes(bytes))
@@ -120,6 +123,7 @@ impl FromStr for PublicKeyBytes {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        eprintln!("came here");
         let s = s.strip_prefix("0x").unwrap_or(s);
         let value = hex::decode(s)?;
         Self::from_bytes(&value[..]).map_err(|_| anyhow::anyhow!("byte deserialization failed"))

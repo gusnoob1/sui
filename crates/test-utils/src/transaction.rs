@@ -3,6 +3,7 @@
 
 use crate::authority::get_client;
 use crate::messages::{create_publish_move_package_transaction, make_certificates};
+use crate::test_keys;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use sui_config::ValidatorInfo;
@@ -17,7 +18,8 @@ pub async fn publish_package(
     path: PathBuf,
     configs: &[ValidatorInfo],
 ) -> ObjectRef {
-    let transaction = create_publish_move_package_transaction(gas_object, path);
+    let (sender, keypair) = test_keys().pop().unwrap();
+    let transaction = create_publish_move_package_transaction(gas_object.compute_object_reference(), path, sender, &keypair);
     let effects = submit_single_owner_transaction(transaction, configs).await;
     parse_package_ref(&effects).unwrap()
 }
@@ -100,7 +102,7 @@ pub fn get_unique_effects(replies: Vec<TransactionInfoResponse>) -> TransactionE
 
 /// Extract the package reference from a transaction effect. This is useful to deduce the
 /// authority-created package reference after attempting to publish a new Move package.
-fn parse_package_ref(effects: &TransactionEffects) -> Option<ObjectRef> {
+pub fn parse_package_ref(effects: &TransactionEffects) -> Option<ObjectRef> {
     effects
         .created
         .iter()
