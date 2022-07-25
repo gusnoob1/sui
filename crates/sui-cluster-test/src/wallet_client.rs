@@ -20,6 +20,7 @@ pub struct WalletClient {
     fullnode_client: GatewayClient,
 }
 
+#[allow(clippy::borrowed_box)]
 impl WalletClient {
     pub fn new_from_cluster(cluster: &Box<dyn Cluster + Sync + Send>) -> Self {
         let temp_dir = tempfile::tempdir().unwrap();

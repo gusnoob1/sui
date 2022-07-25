@@ -20,22 +20,6 @@ use tracing::debug;
 /// verification results are unexpected. `check_into_sui_object` and
 /// `check_info_gas_object` expect to get a `SuiObject` and `GasObject`
 /// respectfully.
-///
-/// Example 1:
-/// ```
-/// let gas_coin: GasCoin = ObjectChecker::new(object_id)
-///     .owner(Owner::AddressOwner(address))
-///     .check_into_gas_coin(client.get_fullnode())
-///     .await;
-/// ```
-///
-/// Example 2:
-/// ```
-/// // It panics because deleted object does not give a live SuiObject
-/// let sui_object: SuiObject<SuiParsedMoveObject> = ObjectChecker::new(object_id)
-///     .deleted()
-///     .check_into_sui_object(client.get_fullnode())
-///     .await;
 /// ```
 #[derive(Debug)]
 pub struct ObjectChecker {
@@ -216,7 +200,7 @@ impl TransferObjectEventChecker {
         self
     }
 
-    pub fn check(self, event: &SuiEvent) -> () {
+    pub fn check(self, event: &SuiEvent) {
         if let SuiEvent::TransferObject {
             package_id,
             transaction_module,
